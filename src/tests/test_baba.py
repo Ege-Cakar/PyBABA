@@ -285,3 +285,10 @@ def test_large_framework_semantics_smoke():
     for S in prefs:
         assert F.is_admissible(S)
         assert not any(S < T for T in prefs)
+
+def test_semantics_quick():
+    F, (a, b, c, *_ ) = make_basic_framework()
+    assert F.complete_extensions() == [{b, c}]
+    assert F.set_stable_extensions() == [{b, c}]
+    assert F.well_founded_extension() == {b, c}
+    assert F.ideal_extensions() == [{b, c}]

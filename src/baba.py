@@ -208,55 +208,94 @@ class BipolarABA:
         dset = set(delta)
         return {a for a in self.assumptions if self.defends(dset, a)}
 
-    def is_admissible(self, delta: Iterable[Literal]) -> bool:
-        dset = set(delta)
-        return self.is_closed(dset) and self.conflict_free(dset) and self.defends_set(dset, dset)
-
-    def _enum_adm_pref(self) -> tuple[set[frozenset[Literal]], set[frozenset[Literal]]]:
-        """Backtracking search with pruning. Returns (admissible_sets, preferred_sets)."""
+    # generic back-tracking over admissible supersets, with extra filter (for finding extensions)
+    def _enum_with_filter(
+        self,
+        keep_fn: Callable[[Set[Literal]], bool],
+        need_maximal: bool = False,
+    ) -> list[Set[Literal]]:
+        """
+        Enumerate all admissible sets that also satisfy `keep_fn(S)`.
+        If need_maximal=True, keep only ⊆-maximal ones.
+        """
         ordered = tuple(sorted(self.assumptions, key=lambda l: l.key))
-        visited: set[frozenset[Literal]] = set()
-        adm_sets: set[frozenset[Literal]] = set()
-        pref_sets: set[frozenset[Literal]] = set()
+        seen: set[frozenset[Literal]] = set()
+        results: list[Set[Literal]] = []
 
         def dfs(current: Set[Literal], start_idx: int) -> None:
             cur_f = frozenset(current)
-            if cur_f in visited:
+            if cur_f in seen:
                 return
-            visited.add(cur_f)
+            seen.add(cur_f)
 
-            # record admissible (cheap check thanks to pruning)
-            if self.is_admissible(current):
-                adm_sets.add(cur_f)
+            if self.is_admissible(current) and keep_fn(current):
+                results.append(current)
 
-            extendable = False
             for i in range(start_idx, len(ordered)):
                 a = ordered[i]
                 if a in current:
                     continue
                 new_set = self.closure(current | {a})
-                # prune early
                 if not self.conflict_free(new_set):
                     continue
                 if not self.defends_set(new_set, new_set):
                     continue
-                extendable = True
                 dfs(new_set, i + 1)
-
-            # maximal wrt ⊆ among explored = candidate preferred
-            if not extendable and self.is_admissible(current):
-                pref_sets.add(cur_f)
 
         dfs(set(), 0)
 
-        # ensure true maximality (remove any that is subset of another)
-        pref_sets = {S for S in pref_sets if not any(S < T for T in pref_sets)}
-        return adm_sets, pref_sets
+        if need_maximal:
+            maximal = [S for S in results if not any(S < T for T in results)]
+            return maximal
+        return results
+
+# -------- EXTENSIONS -----------
+
+    def is_admissible(self, delta: Iterable[Literal]) -> bool:
+        dset = set(delta)
+        return self.is_closed(dset) and self.conflict_free(dset) and self.defends_set(dset, dset)
 
     def admissible_extensions(self) -> list[Set[Literal]]:
-        adm, _ = self._enum_adm_pref()
-        return [set(s) for s in adm]
+        return self._enum_with_filter(lambda _: True)
 
     def preferred_extensions(self) -> list[Set[Literal]]:
-        _, pref = self._enum_adm_pref()
-        return [set(s) for s in pref]
+        return self._enum_with_filter(lambda _: True, need_maximal=True)
+
+    def is_complete(self, delta: Iterable[Literal]) -> bool:
+        dset = set(delta)
+        return (
+            self.is_admissible(dset)
+            and dset == self.defended_by(dset)        # fix-point condition
+        )
+
+    def complete_extensions(self) -> list[Set[Literal]]:
+        return self._enum_with_filter(self.is_complete) 
+
+    def is_set_stable(self, delta: Iterable[Literal]) -> bool:
+        dset = set(delta)
+        if not (self.is_closed(dset) and self.conflict_free(dset)):
+            return False
+        outsiders = self.assumptions - dset
+        for beta in outsiders:
+            if not self.attacks_set(dset, self.closure({beta})):
+                return False
+        return True
+
+    def set_stable_extensions(self) -> list[Set[Literal]]:
+        return self._enum_with_filter(self.is_set_stable)
+
+    def well_founded_extension(self) -> Set[Literal] | None:
+        comps = self.complete_extensions()
+        if not comps:
+            return None
+        inter = set.intersection(*map(set, comps))
+        return inter
+
+    def ideal_extensions(self) -> list[Set[Literal]]:
+        prefs = self.preferred_extensions()
+        if not prefs:
+            return []      # definition vacuous if no preferred
+        def subset_of_all_pref(S: Set[Literal]) -> bool:
+            return all(S.issubset(P) for P in prefs)
+        # need ⊆-max admissible sets that are subset of every preferred
+        return self._enum_with_filter(subset_of_all_pref, need_maximal=True)
