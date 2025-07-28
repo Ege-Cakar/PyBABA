@@ -3,13 +3,14 @@ from dataclasses import dataclass, field
 from typing import Dict, Set, Any, Tuple, Callable, Iterable
 from collections import Counter
 from itertools import combinations
+from copy import deepcopy
 
 # Notes:
 # Δ attacks β iff there exists a subset Δ′ ⊆ Δ such that Δ′ ⊢ ¯β (a deduction of the contrary of β). Since in deductions 
 # you can utilize rules whos bodies are in ∆, anything that can be reached from ∆' can be utilized in the derivation of ¯β
 # Thus, checking attackers among Cl(Δ) is equivalent to searching all derivations.
 
-# ---------- Literal ----------
+# ---------- Dataclasses ----------
 @dataclass(frozen=True)
 class Literal:
     key: str
@@ -22,6 +23,45 @@ class Literal:
         return self.key
 
 # Extendable for logic later
+
+@dataclass
+class DerivationNode:
+    literal: "Literal"
+    rule: "Rule | None"                    # None for Δ-leaf
+    child: "DerivationNode | None" = None  # at most one child
+
+    # nice console view
+    def pretty(self, indent: int = 0) -> str:
+        pad = "  " * indent
+        head = f"{pad}{self.literal.key}"
+        if self.rule:
+            head += f"   ← {self.rule.body.key}"
+        if self.child:
+            return head + "\n" + self.child.pretty(indent + 1)
+        return head
+
+    # Graphviz-DOT export
+    def to_dot(self, parent_id: int | None = None, counter: list[int] | None = None) -> str:
+        if counter is None:
+            counter = [0]
+        my_id = counter[0]; counter[0] += 1
+        lines = [f'  n{my_id} [label="{self.literal.key.replace(chr(34), r"\"")}"];']
+        if parent_id is not None:
+            lines.append(f'  n{parent_id} -> n{my_id};')
+        if self.child:
+            lines.append(self.child.to_dot(my_id, counter))
+        return "\n".join(lines)
+
+
+@dataclass
+class DerivationTree:
+    root: DerivationNode
+
+    def pretty(self) -> str:
+        return self.root.pretty()
+
+    def to_dot(self) -> str:
+        return "digraph Derivation {\n" + self.root.to_dot() + "\n}"
 
 # ---------- Rule ----------
 @dataclass(frozen=True)
@@ -299,3 +339,243 @@ class BipolarABA:
             return all(S.issubset(P) for P in prefs)
         # need ⊆-max admissible sets that are subset of every preferred
         return self._enum_with_filter(subset_of_all_pref, need_maximal=True)
+    
+    def build_derivation_tree(self, delta: Iterable["Literal"], goal: "Literal") -> "DerivationTree | None":
+        """
+        Return ONE derivation tree of `goal` from Δ, or None if goal not derivable.
+        Works under Bipolar-ABA’s single-body rule restriction.
+        """
+        # we work with the closure once
+        base = set(delta)
+        if not base.issubset(self.assumptions):
+            raise ValueError("Δ must contain only assumptions")
+
+        cl = self.closure(base)
+
+        # recursive helper
+        def derive(target: Literal) -> DerivationNode | None:
+            # 1. leaf?  (target directly provided by Δ)
+            if target in base:
+                return DerivationNode(target, None, None)
+
+            # 2. support rule head?
+            for body in cl:
+                if target in self._support_from[body]:
+                    child = derive(body)
+                    if child:
+                        return DerivationNode(target, Rule(target, body), child)
+
+            # 3. contrary head?
+            if target in self._inv_contrary:           # target = ¬β
+                attacked = self._inv_contrary[target]
+                for body in cl:
+                    if attacked in self._attack_from[body]:
+                        child = derive(body)
+                        if child:
+                            return DerivationNode(target, Rule(target, body), child)
+
+            return None  # no derivation found
+
+        root_node = derive(goal)
+        return DerivationTree(root_node) if root_node else None
+    #  Enumerate *all* derivation trees for a goal from Δ
+    def build_all_derivation_trees(
+        self,
+        delta: Iterable["Literal"],
+        goal: "Literal",
+        max_paths: int | None = None,           # optional cut-off
+    ) -> list["DerivationTree"]:
+        """
+        Return a list of DerivationTree objects, one for each distinct path that
+        derives `goal` from Δ.  Stops early after `max_paths` (if given).
+        """
+        base = set(delta)
+        if not base.issubset(self.assumptions):
+            raise ValueError("Δ must contain only assumptions")
+
+        cl = self.closure(base)
+        trees: list[DerivationTree] = []
+
+        def dfs(target: Literal, seen: set[Literal]) -> list[DerivationNode]:
+            """Return all DerivationNode roots that derive `target`."""
+            if target in seen:                                   # avoid cycles
+                return []
+            if max_paths is not None and len(trees) >= max_paths:
+                return []
+
+            # case 1: leaf
+            if target in base:
+                return [DerivationNode(target, None, None)]
+
+            results: list[DerivationNode] = []
+
+            # case 2: support rules
+            for body in self.assumptions:
+                if body in cl and target in self._support_from[body]:
+                    for child in dfs(body, seen | {target}):
+                        results.append(
+                            DerivationNode(target, Rule(target, body), child)
+                        )
+
+            # case 3: attack rules if target is a contrary
+            if target in self._inv_contrary:
+                attacked = self._inv_contrary[target]
+                for body in cl:
+                    if attacked in self._attack_from[body]:
+                        for child in dfs(body, seen | {target}):
+                            results.append(
+                                DerivationNode(target, Rule(target, body), child)
+                            )
+
+            return results
+
+        roots = dfs(goal, set())
+        for r in roots:
+            trees.append(DerivationTree(r))
+            if max_paths is not None and len(trees) >= max_paths:
+                break
+        return trees
+
+    def build_dialectical_tree(
+        self,
+        delta: Iterable["Literal"],
+        alpha: "Literal",
+        semantics: str = "admissible",
+        max_depth: int | None = None,
+    ) -> "DialecticalTree":
+        """
+        Build a dialogue tree under the chosen semantics.
+        semantics ∈ {"admissible", "preferred"} #TODO: Implement the others too!
+        """
+        drv_cls = {"admissible": AdmissibleDriver,
+                "preferred": PreferredDriver}.get(semantics)
+        if drv_cls is None:
+            raise ValueError(f"unsupported semantics {semantics!r}")
+        driver = drv_cls(self)
+
+        Δ = set(delta)
+        if alpha not in self.assumptions:
+            raise ValueError("alpha must be an assumption")
+        if not Δ.issubset(self.assumptions):
+            raise ValueError("Δ must contain only assumptions")
+
+        root = DialecticalNode("pro", Δ, alpha)
+
+        def expand(node: DialecticalNode, depth: int):
+            if max_depth is not None and depth >= max_depth:
+                return
+
+            if node.role == "pro":
+                if node.target is None:
+                    return  # nothing to defend at this level
+                for B in driver.closed_attackers(node.target):
+                    opp = DialecticalNode("opp", B, node.target)
+                    node.children.append(opp)
+                    expand(opp, depth + 1)
+
+            else:  # node.role == "opp"
+                B = node.support_set
+                # minimal counter-attack: find some subset of Δ that attacks B
+                attacker = next(( {x} for x in Δ if self.attacks({x}, next(iter(B))) ),
+                                None)
+                if attacker is None and self.attacks_set(Δ, B):
+                    attacker = Δ
+                if attacker:
+                    pro = DialecticalNode("pro", attacker, None)
+                    node.children.append(pro)
+                    # optional deeper defence on each β in B
+                    for beta in B:
+                        child = DialecticalNode("pro", attacker, beta)
+                        pro.children.append(child)
+                        expand(child, depth + 2)
+
+        expand(root, 0)
+
+        # apply extra burden (e.g. maximality) at root
+        if not driver.extra_burden(root.support_set):
+            root.children.append(
+                DialecticalNode("fail", set(), None)  # marks unmet burden
+            )
+        return DialecticalTree(root)
+
+class _BaseDriver:
+    """Abstract helper—concrete subclasses below."""
+    def __init__(self, F: "BipolarABA"):
+        self.F = F
+
+    # --- required hooks ---                                     #
+    def closed_attackers(self, alpha: "Literal") -> list[Set["Literal"]]:
+        raise NotImplementedError
+
+    def pro_can_answer(self, B: Set["Literal"], delta: Set["Literal"]) -> bool:
+        raise NotImplementedError
+
+    # In case we don't set it up or it's not loaded properly
+
+    def extra_burden(self, pro_set: Set["Literal"]) -> bool:
+        """Checks maximality, fixpoints, etc.  Pass-through for admissible."""
+        return True
+
+
+class AdmissibleDriver(_BaseDriver):
+    """Default admissible semantics."""
+    def closed_attackers(self, alpha):
+        return self.F._closed_attackers_of(alpha)
+
+    def pro_can_answer(self, B, delta):
+        return self.F.attacks_set(delta, B)
+
+
+class PreferredDriver(AdmissibleDriver):
+    """⊆-maximal admissible."""
+    def extra_burden(self, pro_set):
+        # Δ is ⊆-maximal admissible iff no admissible superset exists.
+        for a in self.F.assumptions - pro_set:
+            sup = self.F.closure(pro_set | {a})
+            if self.F.is_admissible(sup):
+                return False
+        return True
+
+@dataclass
+class DialecticalNode:
+    role: str                       # "pro" or "opp"
+    support_set: Set["Literal"]     # the set making the move
+    target: "Literal | None"        # assumption being discussed (None if node just attacks a set)
+    children: list["DialecticalNode"] = field(default_factory=list)
+
+    # pretty‐print
+    def pretty(self, indent: int = 0) -> str:
+        pad = "  " * indent
+        who = "PRO" if self.role == "pro" else "OPP"
+        tgt = f" ⇒ {self.target.key}" if self.target else ""
+        head = f"{pad}{who}: {{{', '.join(x.key for x in sorted(self.support_set, key=lambda l: l.key))}}}{tgt}"
+        lines = [head]
+        for ch in self.children:
+            lines.append(ch.pretty(indent + 1))
+        return "\n".join(lines)
+
+    # DOT export
+    def to_dot(self, parent_id: int | None = None, counter: list[int] | None = None) -> str:
+        if counter is None:
+            counter = [0]
+        my_id = counter[0]; counter[0] += 1
+        label = ("PRO" if self.role == "pro" else "OPP") + r"\n{" + \
+                ", ".join(x.key for x in self.support_set) + "}"
+        shape = "box" if self.role == "pro" else "ellipse"
+        lines = [f'  n{my_id} [shape={shape}, label="{label}"];']
+        if parent_id is not None:
+            lines.append(f'  n{parent_id} -> n{my_id};')
+        for ch in self.children:
+            lines.append(ch.to_dot(my_id, counter))
+        return "\n".join(lines)
+
+
+@dataclass
+class DialecticalTree:
+    root: DialecticalNode
+
+    def pretty(self) -> str:
+        return self.root.pretty()
+
+    def to_dot(self) -> str:
+        return "digraph Dialogue {\n" + self.root.to_dot() + "\n}"

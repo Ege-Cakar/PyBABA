@@ -292,3 +292,26 @@ def test_semantics_quick():
     assert F.set_stable_extensions() == [{b, c}]
     assert F.well_founded_extension() == {b, c}
     assert F.ideal_extensions() == [{b, c}]
+
+def main():
+    F, (a, b, c, na, *_ ) = make_basic_framework()
+
+    # add an extra attack route:   ¬a ← c
+    F.rules.add(Rule(na, c))
+    F._index_rules()   # refresh indices
+
+    trees = F.build_all_derivation_trees({a}, na)
+    for i, t in enumerate(trees, 1):
+        print(f"\n=== Derivation {i} ===")
+        print(t.pretty())
+
+    G, (a, b, d, *_ ) = make_defence_framework()
+
+    print("=== Admissible Δ={a} defends a ===")
+    print(G.build_dialectical_tree({a}, a, "admissible").pretty())
+
+    print("\n=== Preferred Δ={a} defends a (should fail maximality) ===")
+    print(G.build_dialectical_tree({a}, a, "preferred").pretty())
+
+if __name__ == "__main__":
+    main()
